@@ -75,7 +75,7 @@ Termostat poskytuje stavy:
 ---
 
 ### 3D náhled elektroniky
-![Electronic module](./images/electronic.png)
+![Electronic module](./images/electronics.png)
 
 ---
 
