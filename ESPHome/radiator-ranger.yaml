@@ -1,0 +1,906 @@
+################################################################################
+# Substitution Variables – společné parametry pro celé zařízení
+################################################################################
+substitutions:
+  # Interní názvy zařízení
+  device_internal_name: "radiator-ranger"
+  device_suffix: "_ranger"
+  device_friendly_suffix: " ranger"
+
+  # Odvozené názvy
+  device_wifi_name: "${device_internal_name}_wifi"
+  device_friendly_name: "Radiátor${device_friendly_suffix}"
+  
+  # Frekvence obnovování stavu wifi připojení a uptime
+  device_sampling_time: "10s"
+
+  # Jas LED (0.0–1.0)
+  led_green_brightness: "0.4"
+  led_red_brightness: "0.6"
+
+  # Adresy teplotních čidel DS18B20 (diagnostika / fallback)
+  dallas_diag: "0xab000000836f6328"
+  dallas_fallback: "0xd500000083450828"
+
+  # Externí teplota z HA – hlavní prostorové čidlo pro regulaci
+  external_temp_sensor: "sensor.teplomer${device_suffix}_temperature"
+  # Pro ladění je možné dočasně použít např.:
+  # external_temp_sensor: "input_number.debug_temperature"
+
+  # Externí binární senzor topné sezóny z HA
+  heating_season_entity: "input_boolean.topna_sezona"
+
+  # Externí binární senzor otevřeného okna či dveří z HA
+  # Pokud reálný senzor není, použije se dummy helper stále „zavřeno“.
+  open_window_entity: "input_boolean.dummy_zavreneho_okna"
+
+  # Teploty pro jednotlivé předvolby termostatu (°C)
+  preset_temp_away:      "10"
+  preset_temp_sleep:     "10"
+  preset_temp_home:      "15"
+  preset_temp_comfort:   "15"
+
+  # Doba trvání časově omezeného boostu
+  boost_minutes: "120"
+
+  # Minimální bezpečná teplota radiátoru při větrání (°C)
+  # Pod touto hodnotou už nehrozí „topení z okna“, ale chráníme proti zamrznutí.
+  radiator_safe_temp: "5"
+
+################################################################################
+# Globals – vnitřní stav zařízení
+################################################################################
+globals:
+  # Boost režim:
+  #   0  = boost neaktivní
+  #  >0  = zbývající minuty boostu (časovaný režim)
+  #  -1  = nekonečný boost (dokud se ručně nevypne)
+  - id: boost_minutes
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  # 0=OFF, 1=off_blink, 2=warn_blink, 3=error_steady
+  - id: led_red_state
+    type: int
+    restore_value: no
+    initial_value: '0'   
+
+  # 0=OFF, 1=boost_blink, 2=boost_steady
+  - id: led_green_state
+    type: int
+    restore_value: no
+    initial_value: '0'   
+
+################################################################################
+# Board Configuration – ESP32 platforma
+################################################################################ 
+esp32:
+  board: esp32-c3-devkitm-1
+  variant: ESP32C3
+  framework:
+    type: arduino
+
+esphome:
+  name: ${device_internal_name}
+  friendly_name: ${device_friendly_name}
+  platformio_options:
+    board_build.flash_mode: dio
+
+  on_boot:
+    priority: -10
+    then:
+      - delay: 10s
+      - script.execute: update_valve_logic
+
+################################################################################
+# Enable logging
+################################################################################
+logger:
+
+################################################################################
+# Enable Home Assistant API
+################################################################################
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_encryption_key
+
+################################################################################
+# OTA – aktualizace firmware
+################################################################################
+ota:
+  platform: esphome
+  password: !secret web_server_password
+
+safe_mode:
+
+################################################################################
+# WiFi – připojení + fallback AP
+################################################################################
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+
+  # Fallback hotspot (captive portal) v případě výpadku WiFi
+  ap:
+    ssid: ${device_wifi_name}
+    password: !secret web_server_password
+
+captive_portal:
+
+################################################################################
+# Web Server – jednoduché webové UI (lokální)
+################################################################################
+web_server:
+
+################################################################################
+# Time – čas z Home Assistant
+################################################################################
+time:
+  - platform: homeassistant
+
+################################################################################
+# Buses – DS18B20 (OneWire)
+################################################################################
+one_wire:
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode:
+        input: true
+        pullup: true
+
+################################################################################
+# Outputs – PWM pro LED (LEDC)
+################################################################################
+output:
+  # Zelená LED
+  - platform: ledc
+    pin: GPIO0          # zelená LED
+    id: led_green_out
+    inverted: true      
+    max_power: ${led_green_brightness}
+
+  # Červená LED
+  - platform: ledc
+    pin: GPIO1          # červená LED
+    id: led_red_out
+    inverted: true
+    max_power: ${led_red_brightness}
+
+################################################################################
+# Lights – abstrakce nad LED, včetně efektů pro boost
+################################################################################
+light:
+  - platform: monochromatic
+    id: led_green
+    name: "LED zelená"
+    output: led_green_out
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    internal: true
+    effects:
+      # Efekt pro časovaný boost – krátký záblesk hned na začátku, pak delší pauza.
+      - lambda:
+          name: "boost_blink"
+          update_interval: 200ms
+          lambda: |-
+            static int counter = 0;
+            counter++;
+            if (counter >= 15) {
+              counter = 0;
+            }
+
+            if (counter <= 1) {
+              // "Plný jas" v rámci max_power
+              id(led_green_out).set_level(1.0f);
+            } else {
+              id(led_green_out).set_level(0.0f);
+            }
+
+      # Efekt pro trvalý boost – svítí trvale.
+      - lambda:
+          name: "boost_steady"
+          update_interval: 1000ms
+          lambda: |-
+            id(led_green_out).set_level(1.0f);
+
+  - platform: monochromatic
+    id: led_red
+    name: "LED červená"
+    output: led_red_out
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    internal: true
+    effects:
+      # Efekt pro vypnuté topení – krátký záblesk hned na začátku, pak delší pauza.
+      - lambda:
+          name: "off_blink"
+          update_interval: 200ms
+          lambda: |-
+            static int counter = 0;
+            counter++;
+            if (counter >= 15) {
+              counter = 0;
+            }
+
+            if (counter <= 1) {
+              id(led_red_out).set_level(1.0f);
+            } else {
+              id(led_red_out).set_level(0.0f);
+            }
+
+      # Efekt pro výpadek externího čidla - bliká se střídou cca 50%.
+      - lambda:
+          name: "warn_blink"
+          update_interval: 200ms
+          lambda: |-
+            static int counter = 0;
+            counter++;
+            if (counter >= 15) {
+              counter = 0;
+            }
+
+            if (counter <= 8) {
+              id(led_red_out).set_level(1.0f);
+            } else {
+              id(led_red_out).set_level(0.0f);
+            }
+
+      # Efekt pro ztrátu všech čidel - svítí trvale.
+      - lambda:
+          name: "error_steady"
+          update_interval: 1000ms
+          lambda: |-
+            id(led_red_out).set_level(1.0f);
+
+################################################################################
+# Scripts 
+################################################################################
+# Hlavní skript pro řízení ventilu a LED kontrolek
+script:
+  - id: update_valve_logic
+    mode: restart
+    then:
+      - lambda: |-
+          std::string status;
+
+          // Předpočítat mode a action – použijeme je víckrát
+          auto mode   = id(thermostat01).mode;
+          auto action = id(thermostat01).action;
+
+          // Lokalizovaný název presetu
+          const char *preset_name;
+          auto preset_opt = id(thermostat01).preset;
+
+          if (!preset_opt.has_value()) {
+            preset_name = "Bez předvolby";
+          } else {
+            auto preset = *preset_opt;
+            if (preset == climate::CLIMATE_PRESET_AWAY) {
+              preset_name = "Dovolená";
+            } else if (preset == climate::CLIMATE_PRESET_SLEEP) {
+              preset_name = "Spánek / Pryč";
+            } else if (preset == climate::CLIMATE_PRESET_HOME) {
+              preset_name = "Doma";
+            } else if (preset == climate::CLIMATE_PRESET_COMFORT) {
+              preset_name = "Komfort";
+            } else {
+              preset_name = "Bez předvolby";
+            }
+          }
+
+          bool ext_ok = id(external_temp).has_state();
+          bool int_ok = id(temp_room_internal).has_state();
+
+          // ==========================================
+          // ČERVENÁ LED – desired_red: 0/1/2/3
+          // ==========================================
+          int desired_red = 0;
+
+          if (ext_ok) {
+            if (mode == climate::CLIMATE_MODE_HEAT) {
+              desired_red = 0;      // HEAT + externí OK → zhasnutá
+            } else {
+              desired_red = 1;      // OFF + externí OK → off_blink
+            }
+          } else if (!ext_ok && int_ok) {
+            desired_red = 2;        // externí KO, interní OK → warn_blink
+          } else {
+            desired_red = 3;        // žádné čidlo → error_steady
+          }
+
+          if (id(led_red_state) != desired_red) {
+            id(led_red_state) = desired_red;
+
+            switch (desired_red) {
+              case 0: {
+                auto call = id(led_red).turn_off();
+                call.set_transition_length(0);
+                call.perform();
+                ESP_LOGI("heating_status", "LED RED: OFF");
+                break;
+              }
+              case 1: {
+                auto call = id(led_red).turn_on();
+                call.set_effect("off_blink");
+                call.set_transition_length(0);
+                call.perform();
+                ESP_LOGI("heating_status", "LED RED: off_blink");
+                break;
+              }
+              case 2: {
+                auto call = id(led_red).turn_on();
+                call.set_effect("warn_blink");
+                call.set_transition_length(0);
+                call.perform();
+                ESP_LOGI("heating_status", "LED RED: warn_blink");
+                break;
+              }
+              case 3: {
+                auto call = id(led_red).turn_on();
+                call.set_effect("error_steady");
+                call.set_transition_length(0);
+                call.perform();
+                ESP_LOGI("heating_status", "LED RED: error_steady");
+                break;
+              }
+            }
+          }
+
+          // ==========================================
+          // ZELENÁ LED – desired_green: 0/1/2 podle boostu
+          // ==========================================
+          int desired_green = 0;
+          if (id(boost_minutes) > 0) {
+            desired_green = 1;   // časovaný boost → boost_blink
+          } else if (id(boost_minutes) < 0) {
+            desired_green = 2;   // nekonečný boost → boost_steady
+          }
+
+          if (id(led_green_state) != desired_green) {
+            id(led_green_state) = desired_green;
+
+            switch (desired_green) {
+              case 0: {
+                auto call = id(led_green).turn_off();
+                call.set_transition_length(0);
+                call.perform();
+                ESP_LOGI("heating_status", "LED GREEN: OFF");
+                break;
+              }
+              case 1: {
+                auto call = id(led_green).turn_on();
+                call.set_effect("boost_blink");
+                call.set_transition_length(0);
+                call.perform();
+                ESP_LOGI("heating_status", "LED GREEN: boost_blink");
+                break;
+              }
+              case 2: {
+                auto call = id(led_green).turn_on();
+                call.set_effect("boost_steady");
+                call.set_transition_length(0);
+                call.perform();
+                ESP_LOGI("heating_status", "LED GREEN: boost_steady");
+                break;
+              }
+            }
+          }
+
+          // 1) ANTIFREEZE – diag < ${radiator_safe_temp} NEBO diag nedostupné
+          //    NEBO nemáme temp_for_control → ventil otevřený, požadavek 1
+          bool diag_has = id(temp_radiator_diag).has_state();
+          bool antifreeze_diag = (!diag_has) || (id(temp_radiator_diag).state < ${radiator_safe_temp}.0f);
+          bool ctrl_has = id(temp_for_control).has_state();
+
+          if (antifreeze_diag || !ctrl_has) {
+              id(valve).turn_on();
+              id(heat_demand).publish_state(1.0f);
+              status = "Protizámrzný režim";
+              id(heating_status).publish_state(status);
+              ESP_LOGI("heating_status", "%s", status.c_str());
+              return;
+          }
+
+          // Od teď víme, že temp_for_control má vždy state
+          float current = id(temp_for_control).state;
+          char temp_buf[16];
+          snprintf(temp_buf, sizeof(temp_buf), "%.1f", current);
+
+          // 2) NENÍ TOPNÁ SEZÓNA → ventil otevřený, požadavek 0
+          if (!id(heating_season).state) {
+            id(valve).turn_on();
+            id(heat_demand).publish_state(0.0f);
+            status = "Není topná sezóna";
+            id(heating_status).publish_state(status);
+            ESP_LOGI("heating_status", "%s", status.c_str());
+            return;
+          }
+
+          // 3) BOOST → ventil otevřený, požadavek 1
+          if (id(boost_minutes) != 0) {
+            id(valve).turn_on();
+            id(heat_demand).publish_state(1.0f);
+            status  = "Boost – ";
+            status += temp_buf;
+            status += " °C – ";
+            status += preset_name;
+            id(heating_status).publish_state(status);
+            ESP_LOGI("heating_status", "%s", status.c_str());
+            return;
+          }
+
+          // 4) VĚTRÁNÍ → ventil zavřený, požadavek 0
+          if (id(window_open_delayed).state) {
+            id(valve).turn_off();
+            id(heat_demand).publish_state(0.0f);
+            status  = "Větrání – ";
+            status += temp_buf;
+            status += " °C – ";
+            status += preset_name;
+            id(heating_status).publish_state(status);
+            ESP_LOGI("heating_status", "%s", status.c_str());
+            return;
+          }
+
+          // --------------------------------------------------
+          // 5) NORMÁLNÍ REŽIM – podle climate mode + action
+          //     - Vypnuto
+          //     - Zapnuto (HEAT + IDLE)
+          //     - Topí (HEAT + HEATING)
+          // --------------------------------------------------
+
+          std::string prefix;
+          bool show_preset = true;
+
+          if (mode != climate::CLIMATE_MODE_HEAT) {
+            // Topení TOTÁLNĚ vypnuté → "Vypnuto"
+            id(valve).turn_off();
+            id(heat_demand).publish_state(0.0f);
+            prefix = "Vypnuto";
+            show_preset = false;
+          }
+          else {
+            // MODE = HEAT → sledujeme ACTION
+            switch (action) {
+              case climate::CLIMATE_ACTION_HEATING:
+                // Climate chce topit → "Topí"
+                id(valve).turn_on();
+                id(heat_demand).publish_state(1.0f);
+                prefix = "Topí";
+                break;
+
+              case climate::CLIMATE_ACTION_IDLE:
+                // Je v režimu HEAT, ale hystereze říká „Netop“ → "Zapnuto"
+                id(valve).turn_off();
+                id(heat_demand).publish_state(0.0f);
+                prefix = "Zapnuto";
+                break;
+
+              case climate::CLIMATE_ACTION_OFF:
+              default:
+                // Tady se může ocitnout při startu / přechodu → chováme se jako OFF
+                id(valve).turn_off();
+                id(heat_demand).publish_state(0.0f);
+                prefix = "Vypnuto";
+                show_preset = false;
+                break;
+            }
+          }
+
+          // Skládání statusu
+          status  = prefix;
+          status += " – ";
+          status += temp_buf;     // "XX.X"
+          status += " °C";
+
+          if (show_preset) {
+            status += " – ";
+            status += preset_name;
+          }
+
+          // Publikace do textového senzoru
+          id(heating_status).publish_state(status);
+
+          // Log
+          ESP_LOGI("heating_status", "%s", status.c_str());
+
+################################################################################
+# Switch – relé (ventil topení)
+################################################################################
+
+switch:
+  # Hardware switch pro ventil
+  - platform: gpio
+    id: valve
+    name: "Ventil"
+    internal: true           
+    pin:
+      number: GPIO3
+      mode: OUTPUT_OPEN_DRAIN
+      inverted: false
+    icon: mdi:valve
+    restore_mode: ALWAYS_ON   # fail-safe, ale reálný stav hned po startu přepíše skript
+
+  # Switch pro aktivaci boostu z HA
+  - platform: template
+    id: boost_infinite
+    name: "Boost nekonečný"
+    icon: mdi:rocket-launch
+
+    # Stav switche – zapnuto, pokud je boost_minutes < 0
+    lambda: |-
+      return (id(boost_minutes) < 0);
+
+    # Zapnutí → nastavíme nekonečný boost (-1)
+    turn_on_action:
+      - lambda: |-
+          // Má smysl jen v HEAT a topné sezóně, stejně jako u tlačítka
+          if (id(thermostat01).mode == climate::CLIMATE_MODE_OFF) return;
+          if (id(window_open_delayed).state) return;
+          if (!id(heating_season).state) return;
+
+          id(boost_minutes) = -1;
+      - script.execute: update_valve_logic
+
+    # Vypnutí → zrušíme nekonečný boost (pokud byl) a přepočítáme logiku
+    turn_off_action:
+      - lambda: |-
+          if (id(boost_minutes) < 0) {
+            id(boost_minutes) = 0;
+          }
+      - script.execute: update_valve_logic
+
+################################################################################
+# Numbers - boost minutes
+################################################################################
+number:
+  - platform: template
+    id: boost_duration
+    name: "Boost (minuty)"
+    icon: mdi:rocket-launch-outline
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 600        
+    step: 1
+    mode: box
+
+    # Zobrazení aktuální hodnoty – nekonečný boost (<0) ukážeme jako 0
+    lambda: |-
+      if (id(boost_minutes) > 0) {
+        return (float) id(boost_minutes);
+      }
+      return 0.0f;
+
+    # Když HA nastaví hodnotu → přepíšeme boost_minutes a přepočítáme logiku
+    set_action:
+      - lambda: |-
+          int minutes = (int) x;
+
+          // 0 minut = vypnout boost
+          if (minutes <= 0) {
+            id(boost_minutes) = 0;
+          } else {
+            id(boost_minutes) = minutes;
+          }
+      - script.execute: update_valve_logic
+
+################################################################################
+# Sensors – teploty, WiFi, uptime, externí teplota, fallback, požadavek na topení
+################################################################################
+sensor:
+  # DS18B20 – diagnostická teplota na topném tělese (přímo na radiátoru)
+  - platform: dallas_temp
+    address: ${dallas_diag}
+    id: temp_radiator_diag
+    name: "Teplota radiátoru (diag)"
+    update_interval: 10s
+    entity_category: diagnostic
+    state_class: measurement
+    on_value:
+      - component.update: temp_for_control
+      - script.execute: update_valve_logic
+
+  # DS18B20 – vnitřní fallback teplota v prostoru (lokální čidlo)
+  - platform: dallas_temp
+    address: ${dallas_fallback}
+    id: temp_room_internal
+    name: "Teplota prostoru (fallback)"
+    update_interval: 10s
+    state_class: measurement
+    entity_category: diagnostic
+    on_value:
+      - component.update: temp_for_control
+      - script.execute: update_valve_logic
+
+  # Externí prostorová teplota z HA (typicky nástěnné čidlo v místnosti)
+  - platform: homeassistant
+    entity_id: ${external_temp_sensor}
+    id: external_temp
+    name: "Teplota z HA (externí)"
+    on_value:
+      - component.update: temp_for_control
+      - script.execute: update_valve_logic
+
+  # Hledá dostupný sensor teploty od preferovaného až po fail-safe
+  - platform: template
+    id: temp_for_control
+    name: "Teplota pro regulaci"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+    lambda: |-
+      const bool ext_ok = id(external_temp).has_state();
+      const bool int_ok = id(temp_room_internal).has_state();
+
+      // 1) Externí čidlo dostupné
+      if (ext_ok) {
+        return id(external_temp).state;
+      }
+
+      // 2) Externí čidlo nedostupné, ale interní OK
+      if (!ext_ok && int_ok) {
+        return id(temp_room_internal).state;
+      }
+
+      // 3) Ani jedno čidlo nefunguje → fail-safe 0 °C
+      return 0.0f;
+
+
+  # Požadavek na topení (pro kotel) – 1 = topit, 0 = netopit.
+  # Hodnota se publikuje ručně při změně ventilu a topné sezóny.
+  # V HA je možné jednoduše sečíst všechny radiátory a podle součtu řídit kotel.
+  - platform: template
+    id: heat_demand
+    name: "Požadavek na topení"
+    unit_of_measurement: ""
+    accuracy_decimals: 0
+    icon: mdi:fire
+    update_interval: never
+
+  # WiFi signál – diagnostika kvality spojení
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    id: wifi_rssi
+    update_interval: ${device_sampling_time}
+    entity_category: diagnostic
+
+  # Uptime – servisní informace
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    update_interval: ${device_sampling_time}
+    entity_category: diagnostic
+
+################################################################################
+# Text Sensors – stav topení
+################################################################################
+text_sensor:
+  # Stav topení pro zobrazení na kartě pomocí card_mod
+  - platform: template
+    id: heating_status
+    name: "Stav topení"
+    update_interval: never
+
+################################################################################
+# Binary Sensors – tlačítko, status, topná sezóna, boost, okno
+################################################################################
+binary_sensor:
+  # Tlačítko na GPIO2 – spíná do země, invertované, s anti-chatter filtry.
+  # Jednoduchý stisk, dvojklik a dlouhý stisk ovládají boost režimy a zap/vyp topení.
+  - platform: gpio
+    id: button
+    name: "Tlačítko"
+    internal: true
+    pin:
+      number: GPIO2
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_multi_click:
+      # Jednoduchý stisk → časovaný boost 2 hodiny (${boost_minutes} min) / zrušení boostu.
+      - timing:
+          - ON for 50ms to 400ms
+          - OFF for at least 500ms
+        then:
+          - lambda: |-
+              // Pokud boost neběží → zapnout ${boost_minutes} min
+              if (id(boost_minutes) == 0) {
+                if (id(window_open_delayed).state) return;
+                if (id(thermostat01).mode == climate::CLIMATE_MODE_OFF) return;
+                if (!id(heating_season).state) return;
+                id(boost_minutes) = ${boost_minutes};
+              } else {
+                // Jinak jakýkoli boost zrušit
+                id(boost_minutes) = 0;
+              }
+          - script.execute: update_valve_logic
+
+      # Dvojitý stisk → nekonečný boost (-1), zelená LED svítí trvale.
+      - timing:
+          - ON for 50ms to 400ms
+          - OFF for 50ms to 400ms
+          - ON for 50ms to 400ms
+        then:
+          - lambda: |-
+              if (id(thermostat01).mode == climate::CLIMATE_MODE_OFF) return;
+              if (id(window_open_delayed).state) return;
+              if (!id(heating_season).state) return;
+              id(boost_minutes) = -1;
+          - script.execute: update_valve_logic
+
+      # Dlouhý stisk → vypnutí / zapnutí termostatu (OFF/HEAT)
+      - timing:
+          - ON for at least 2s
+        then:
+          - lambda: |-
+              auto climate_call = id(thermostat01).make_call();
+
+              if (id(thermostat01).mode == climate::CLIMATE_MODE_OFF) {
+                // Zapnout topení
+                climate_call.set_mode(climate::CLIMATE_MODE_HEAT);
+              } else {
+                // Vypnout topení a zrušit boost
+                climate_call.set_mode(climate::CLIMATE_MODE_OFF);
+                id(boost_minutes) = 0;
+              }
+
+              climate_call.perform();
+          - script.execute: update_valve_logic
+
+  # Externí binární senzor – topná sezóna z HA (raw)
+  - platform: homeassistant
+    id: heating_season_raw
+    internal: true
+    entity_id: ${heating_season_entity}
+
+  # Topná sezóna s fallbackem:
+  # - pokud HA nedostupné → topná sezóna = true
+  # - jinak přebírá stav z heating_season_raw
+  - platform: template
+    id: heating_season
+    name: "Topná sezóna"
+    icon: mdi:sun-snowflake-variant
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(heating_season_raw).has_state()) {
+        // HA nedostupné → raději brát, že topná sezóna běží
+        return true;
+      }
+      return id(heating_season_raw).state;
+    on_state:
+      then:
+        - script.execute: update_valve_logic
+
+  # Diagnostika – boost aktivní ano/ne (pro přehled v HA)
+  - platform: template
+    id: boost_active
+    name: "Boost aktivní"
+    device_class: running
+    entity_category: diagnostic
+    icon: mdi:rocket-launch-outline
+    lambda: |-
+      return (id(boost_minutes) != 0);
+
+  # Sensor otevřeného okna (raw stav z HA)
+  - platform: homeassistant
+    id: window_open
+    name: "Otevřené okno"
+    entity_id: ${open_window_entity}
+    entity_category: diagnostic
+
+  # Zpožděný senzor otevřeného okna – logika větrání:
+  # - on_press   → po 2 min trvale otevřeného okna
+  # - on_release → po zavření okna
+  - platform: template
+    id: window_open_delayed
+    name: "Otevřené okno (větrání)"
+    entity_category: diagnostic
+    icon: mdi:window-open-variant
+    lambda: |-
+      // Pokud nemáme stav z HA, chováme se jako zavřené okno
+      if (!id(window_open).has_state()) {
+        return false;
+      }
+      return id(window_open).state;
+    filters:
+      - delayed_on: 2min
+      - delayed_off: 30s
+
+    # Aktivace větrání (po 2 min otevřeného okna)
+    on_press:
+      then:
+        - script.execute: update_valve_logic
+
+    # Ukončení větrání → stačí přepočítat logiku
+    on_release:
+      then:
+        - script.execute: update_valve_logic
+
+################################################################################
+# Interval – odpočet boostu
+################################################################################
+interval:
+  # Odpočet boostu po minutách
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(boost_minutes) > 0) {
+            id(boost_minutes)--;
+          }
+      - script.execute: update_valve_logic
+
+################################################################################
+# Climate – hlavní termostat (logika řízení ventilu)
+################################################################################
+climate:
+  - platform: thermostat
+    id: thermostat01
+    name: "Termostat${device_friendly_suffix}"
+    default_preset: Home
+    on_boot_restore_from: memory
+
+    # Hlavní senzor pro regulaci (fallback mezi externí a interní teplotou)
+    sensor: temp_for_control
+
+    # Ochrany proti častému spínání
+    min_heating_off_time: 120s
+    min_heating_run_time: 120s
+    min_idle_time: 60s
+
+    # Hystereze a přeregulování
+    heat_deadband: 0.2 °C
+    heat_overrun: 0.1 °C
+
+    # Povinné, ale prázdné akce – veškerou logiku dělá update_valve_logic
+    heat_action:
+      - lambda: |-
+          // Záměrně prázdné – ventil řídí script update_valve_logic.
+          ESP_LOGI("thermostat01", "heat_action triggered (no-op).");
+
+    idle_action:
+      - lambda: |-
+          // Záměrně prázdné – ventil řídí script update_valve_logic.
+          ESP_LOGI("thermostat01", "idle_action triggered (no-op).");
+
+    # Při jakékoli změně stavu/módu/presetu přepočítáme logiku ventilu.
+    on_state:
+      then:
+        - script.execute: update_valve_logic
+
+    visual:
+      min_temperature: 10 °C
+      max_temperature: 25 °C
+      temperature_step:
+        target_temperature: 0.5 °C
+        current_temperature: 0.1 °C
+
+    # Předvolby termostatu – hodnoty v substitutions kvůli snadnému dolaďování.
+    preset:
+      - name: Away
+        default_target_temperature_low: ${preset_temp_away}
+        mode: "HEAT"
+
+      - name: Sleep
+        default_target_temperature_low: ${preset_temp_sleep}
+        mode: "HEAT"
+
+      - name: Home
+        default_target_temperature_low: ${preset_temp_home}
+        mode: "HEAT"
+
+      - name: Comfort
+        default_target_temperature_low: ${preset_temp_comfort}
+        mode: "HEAT"
+
+
+
