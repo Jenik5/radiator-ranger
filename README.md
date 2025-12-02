@@ -70,7 +70,7 @@ Termostat poskytuje stavy:
 ---
 
 ### Návrh DPS
-![PCB](./images/PCB.png)
+![PCB](./images/pcb.png)
 
 ---
 
