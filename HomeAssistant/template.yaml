@@ -1,0 +1,39 @@
+template:
+  - sensor:
+      - name: "Požadavek na topení – součet"
+        unique_id: pozadavek_na_topeni_soucet
+        icon: mdi:radiator
+        state_class: measurement
+
+        # Součet všech *_pozadavek_na_topeni (unavailable/unknown -> 0)
+        state: >
+          {% set entities = states.sensor
+               | selectattr('entity_id', 'search', '_pozadavek_na_topeni$')
+               | list %}
+          {{ entities
+               | map(attribute='state')
+               | map('float', 0)
+               | sum }}
+
+        attributes:
+          # Seznam všech entit, které jsou zahrnuté do součtu
+          detail_entities: >
+            {{ states.sensor
+                 | selectattr('entity_id', 'search', '_pozadavek_na_topeni$')
+                 | map(attribute='entity_id')
+                 | list }}
+
+          # Jejich hodnoty převedené na float (unavailable/unknown -> 0)
+          detail_values: >
+            {{ states.sensor
+                 | selectattr('entity_id', 'search', '_pozadavek_na_topeni$')
+                 | map(attribute='state')
+                 | map('float', 0)
+                 | list }}
+
+          # Počet senzorů v součtu
+          count_entities: >
+            {{ states.sensor
+                 | selectattr('entity_id', 'search', '_pozadavek_na_topeni$')
+                 | list
+                 | count }}
