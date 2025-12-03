@@ -1,4 +1,5 @@
 # Příklad nastavení karty "dlaždice" (tile) s využitím sensoru "stav topení"
+# Výsledek je v images/ui.png
 type: tile
 entity: climate.radiator_v_predsini_termostat_v_predsini
 name:
