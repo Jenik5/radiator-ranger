@@ -1,0 +1,20 @@
+# Příklad nastavení karty "dlaždice" (tile) s využitím sensoru "stav topení"
+type: tile
+entity: climate.radiator_v_predsini_termostat_v_predsini
+name:
+  type: area
+show_entity_picture: false
+hide_state: true
+vertical: false
+icon_tap_action:
+  action: more-info
+features:
+  - type: target-temperature
+features_position: inline
+card_mod:
+  style:
+    ha-tile-info$: |
+      .secondary::after {
+        content: "{{ states('sensor.radiator_v_predsini_stav_topeni') }}";
+        color: var(--primary-text-color);
+      }
