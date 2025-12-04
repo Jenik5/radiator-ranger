@@ -93,3 +93,185 @@ Topná sezóna má vyšší prioritu než Boost — pokud je mimo sezónu, bude 
 
 ### **WiFi RSSI**
 Síla WiFi signálu v dBm.
+
+---
+
+## Konfigurace
+
+Většina chování termostatu se nastavuje pomocí bloku `substitutions` v ESPHome YAML konfiguraci.  
+Tento blok umožňuje:
+
+- přizpůsobit názvy entit a zařízení,
+- napojit termostat na externí senzory a přepínače v Home Assistantu,
+- nastavit jas LED indikace,
+- definovat teplotní předvolby,
+- upravit Boost a ochranné teploty,
+- a zpřehlednit konfiguraci pomocí jednotné systematiky názvů.
+
+Použití substitutions výrazně zjednodušuje přenositelnost mezi místnostmi.
+
+---
+
+### Interní a uživatelské názvy zařízení
+
+```yaml
+# Interní názvy zařízení
+device_internal_name: "radiator-v-predsini"
+device_suffix: "_v_predsini"
+device_friendly_suffix: " v předsíni"
+```
+
+#### Doporučená systematika názvů
+
+- **device_internal_name**  
+  Interní název zařízení používaný ESPHome.  
+  Doporučený formát:
+  - bez mezer a bez diakritiky,
+  - **pomlčky místo podtržítek** (ESPHome může mít s podtržítky problémy),
+  - obsahuje přímo umístění,
+  - příklad: `"radiator-v-predsini"`.
+
+  Tento název se většinou automaticky vytvoří při zakládání jednotky v ESPHome.
+
+- **device_suffix**  
+  Sufix používaný v Home Assistantu při generování názvů entit.  
+  Podtržítka jsou zde povolena a praktická.  
+  Příklad: `"v_predsini"`.
+
+- **device_friendly_suffix**  
+  Lidsky čitelné jméno s mezerami a diakritikou.   
+  Příklad: `"v předsíni"`.
+
+Díky této systematice se automaticky odvodí i:
+
+```yaml
+device_wifi_name: "${device_internal_name}_wifi"
+device_friendly_name: "Radiátor ${device_friendly_suffix}"
+```
+
+---
+
+### Interval aktualizace diagnostiky
+
+```yaml
+device_sampling_time: "10s"
+```
+
+- Určuje, jak často se aktualizují stavové informace (WiFi RSSI, uptime…).  
+- Hodnota ve formátu `10s`, `30s`, `1min`.  
+- Doporučený interval je **10–60 sekund**.
+
+---
+
+### Jas stavových LED
+
+```yaml
+led_green_brightness: "0.4"  
+led_red_brightness: "0.6"
+```
+
+- Rozsah 0.0–1.0 (0 = zhasnuto, 1 = maximální jas).  
+- Slouží také k **vyvážení jasu obou LED**, protože různé barvy svítí rozdílně.
+- Také je možné snížit jas na minimum v místnostech, kde by to rušilo.
+
+---
+
+### Adresy teplotních čidel DS18B20
+
+```yaml
+dallas_diag: "0xab000000836f6328"  
+dallas_fallback: "0xd500000083450828"
+```
+
+Termostat používá dvě čidla:
+
+- **dallas_diag** – čidlo na radiátoru (diagnostika, ochrana proti zamrznutí)  
+- **dallas_fallback** – interní prostorové čidlo (náhradní teplota pro regulaci)
+
+#### Postup při prvním spuštění
+
+Po prvním startu se čidla **nepřihlásí**, protože nejsou známé jejich adresy.  
+Adresy je potřeba přečíst z ESPHome logu:
+
+```yaml
+[14:43:52.798][C][gpio.one_wire:021]: GPIO 1-wire bus:  
+[14:43:52.803][C][gpio.one_wire:022]:   Pin: GPIO4  
+[14:43:52.810][C][gpio.one_wire:084]:   Found devices:  
+[14:43:52.815][C][gpio.one_wire:086]:     0xd500000083450828 (DS18B20)  
+[14:43:52.822][C][gpio.one_wire:086]:     0xab000000836f6328 (DS18B20)
+```
+
+Postup:
+
+1. Adresy zapíšeme do substitutions  
+2. Provedeme **druhý start**  
+3. Ověříme správnost – jedno čidlo stiskneme mezi prsty a sledujeme, kterému senzoru stoupá teplota  
+4. Pokud roste teplota druhému senzoru, adresy je potřeba vyměnit
+
+---
+
+### Externí teplotní a stavové entity z Home Assistantu
+
+```yaml
+external_temp_sensor: "sensor.teplomer_${device_suffix}_teplota"  
+heating_season_entity: "input_boolean.topna_sezona"
+open_window_entity: "binary_sensor.senzor_okna_${device_suffix}_otevirani"
+#open_window_entity: "input_boolean.dummy_zavreneho_okna"
+```
+
+- **external_temp_sensor**  
+  Externí prostorová teplota používaná pro regulaci.  
+  Pokud dodržujeme systematiku názvů, název se **sám poskládá**.
+
+- **heating_season_entity**  
+  Binární entita určující topnou sezónu.  
+  Typicky **pomocník (input_boolean)**.
+
+- **open_window_entity**  
+  Senzor otevřeného okna.  
+  Při dodržení systematiky názvů se dá jednoduše odvodit správný název.  
+  Pokud není reálný sensor okna, použije se dummy helper.
+
+---
+
+### Teplotní předvolby
+
+```yaml
+preset_temp_away:      "10"  
+preset_temp_sleep:     "18"  
+preset_temp_home:      "20"  
+preset_temp_comfort:   "22"
+```
+
+Význam režimů:
+
+- **Away** – útlum pro dlouhodobou nepřítomnost  
+- **Sleep** – spánek. Vhodné i pro **krátkodobou nepřítomnost** (např. v práci)  
+- **Home** – běžná teplota při pohybu v místnosti  
+- **Comfort** – vyšší teplota při odpočinku (sedění, čtení…)
+
+---
+
+### Boost
+
+```yaml
+boost_minutes: "120"  
+```
+
+- **boost_minutes**  
+  Délka časově omezeného Boostu.  
+  Lze využít i prakticky, např. pro **sušení věcí** na radiátoru.
+
+---
+
+### Bezpečnostní teplota radiátoru
+
+```yaml
+radiator_safe_temp: "5"
+```
+
+- **radiator_safe_temp**  
+  Minimální teplota radiátoru při větrání.  
+  Pod touto hodnotou nehrozí ztráty tepla a zároveň se chrání proti zamrznutí.
+
+---
